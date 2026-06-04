@@ -527,7 +527,7 @@ elif mode == "🖼️ Image Upload":
                                 if len(st.session_state.detection_log) > 10:
                                     st.session_state.detection_log.pop()
 
-                        st.dataframe(pd.DataFrame(detection_data), use_column_width=True)
+                        st.dataframe(pd.DataFrame(detection_data), use_container_width=True)
 
                         # Speak detections
                         for det in detections:
@@ -611,7 +611,7 @@ elif mode == "🎬 Video Upload":
                 df_stats = pd.DataFrame(detection_stats)
                 if 'bbox' in df_stats.columns:
                     df_stats = df_stats.drop(columns=['bbox'])
-                st.dataframe(df_stats, use_column_width=True)
+                st.dataframe(df_stats, use_container_width=True)
 
 # ============================================================================
 # Update stats display for all modes
