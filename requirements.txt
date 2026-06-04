@@ -5,4 +5,3 @@ numpy==1.24.3
 ultralytics==8.0.207
 Pillow==10.0.1
 pandas==2.0.3
-av==10.0.0
