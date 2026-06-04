@@ -203,7 +203,7 @@ class ObjectDetectionSystem:
                                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
 
         # Announce obstacles
-        if detected_obstacles and 'tts_handler' in st.session_state:
+        if detected_obstacles:
             current_time = time.time()
             filtered_obstacles = []
             
@@ -241,6 +241,43 @@ class ObjectDetectionSystem:
 
         return self.process_frame(image, save_detection=True)
 
+    def process_video(self, video_path):
+        """Process video file and return detections"""
+        cap = cv2.VideoCapture(video_path)
+        fps = int(cap.get(cv2.CAP_PROP_FPS))
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        
+        detections = []
+        frame_count = 0
+        skip_frames = max(1, fps // 3)
+        
+        progress_bar = st.progress(0)
+        video_placeholder = st.empty()
+        
+        while cap.isOpened():
+            ret, frame = cap.read()
+            if not ret:
+                break
+                
+            if frame_count % skip_frames == 0:
+                processed_frame, frame_dets = self.process_frame(
+                    frame, save_detection=st.session_state.save_detections
+                )
+                detections.extend(frame_dets)
+                
+                # Update progress
+                progress = frame_count / total_frames if total_frames > 0 else 0
+                progress_bar.progress(min(1.0, progress))
+                
+                # Display frame
+                processed_frame_rgb = cv2.cvtColor(processed_frame, cv2.COLOR_BGR2RGB)
+                video_placeholder.image(processed_frame_rgb, channels="RGB", use_column_width=True)
+                
+            frame_count += 1
+            
+        cap.release()
+        return detections
+
     def get_export_data(self):
         if not self.detection_history:
             return pd.DataFrame()
@@ -260,8 +297,6 @@ if 'detection_system' not in st.session_state:
     st.session_state.detection_system = ObjectDetectionSystem()
 if 'tts_handler' not in st.session_state:
     st.session_state.tts_handler = WebSpeechHandler()
-if 'mode' not in st.session_state:
-    st.session_state.mode = "image"  # Default to image mode to avoid webcam issues
 if 'save_detections' not in st.session_state:
     st.session_state.save_detections = True
 if 'detection_log' not in st.session_state:
@@ -297,18 +332,6 @@ if detection_system.model_loaded:
     st.sidebar.success("✅ Model Loaded")
 else:
     st.sidebar.warning("⚠️ Click 'Load Model'")
-
-st.sidebar.markdown("---")
-
-# Mode selection
-st.sidebar.subheader("🎥 Input Mode")
-mode = st.sidebar.radio(
-    "Select mode:",
-    ["🖼️ Image Upload", "🎬 Video Upload"],  # Removed Webcam temporarily
-    index=0
-)
-
-st.session_state.mode = "image" if mode == "🖼️ Image Upload" else "video"
 
 st.sidebar.markdown("---")
 
@@ -351,12 +374,16 @@ if st.sidebar.button("📊 Export as CSV", use_container_width=True):
         b64 = base64.b64encode(csv.encode()).decode()
         href = f'<a href="data:file/csv;base64,{b64}" download="detection_log_{datetime.now().strftime("%Y%m%d_%H%M%S")}.csv">Download CSV</a>'
         st.sidebar.markdown(href, unsafe_allow_html=True)
+        st.sidebar.success(f"Exported {len(df)} detections!")
 
 if st.sidebar.button("🗑️ Clear History", use_container_width=True):
     detection_system.clear_history()
     st.session_state.detection_count = 0
     st.session_state.detection_log = []
     st.sidebar.success("Cleared!")
+
+st.sidebar.markdown("---")
+st.sidebar.info("💡 Upload images or videos for detection. Voice feedback will play automatically!")
 
 # ============================================================================
 # MAIN CONTENT
@@ -386,104 +413,107 @@ with tab1:
         stats_placeholder = st.empty()
 
 # ============================================================================
-# IMAGE UPLOAD MODE
+# IMAGE UPLOAD
 # ============================================================================
-if st.session_state.mode == "image":
-    st.subheader("🖼️ Upload an Image")
+st.subheader("🖼️ Image Detection")
 
-    uploaded_file = st.file_uploader("Choose an image...", type=['jpg', 'jpeg', 'png', 'bmp'])
+uploaded_image = st.file_uploader("Choose an image...", type=['jpg', 'jpeg', 'png', 'bmp'], key="image_upload")
 
-    if uploaded_file:
-        if not detection_system.model_loaded:
-            st.error("⚠️ Please load the model first!")
-        else:
-            image = Image.open(uploaded_file)
-            st.image(image, caption="Original Image", use_column_width=True)
+if uploaded_image:
+    if not detection_system.model_loaded:
+        st.error("⚠️ Please load the model first!")
+    else:
+        image = Image.open(uploaded_image)
+        st.image(image, caption="Original Image", use_column_width=True)
 
-            with st.spinner("Detecting objects..."):
-                processed_image, detections = detection_system.process_image(image)
+        with st.spinner("Detecting objects..."):
+            processed_image, detections = detection_system.process_image(image)
 
-                if processed_image is not None:
-                    processed_image_rgb = cv2.cvtColor(processed_image, cv2.COLOR_BGR2RGB)
-                    st.image(processed_image_rgb, caption="Detection Results", use_column_width=True)
+            if processed_image is not None:
+                processed_image_rgb = cv2.cvtColor(processed_image, cv2.COLOR_BGR2RGB)
+                st.image(processed_image_rgb, caption="Detection Results", use_column_width=True)
 
-                    if detections:
-                        st.success(f"✅ Found {len(detections)} objects!")
+                if detections:
+                    st.success(f"✅ Found {len(detections)} objects!")
 
-                        detection_data = []
-                        for det in detections:
-                            detection_data.append({
-                                'Object': det['object'],
-                                'Confidence': f"{det['confidence']:.1%}",
-                                'Proximity': det['proximity'],
-                                'Area %': det['area_percent']
-                            })
-                            
-                            # Update log
-                            if det['proximity'] in ['close', 'medium distance']:
-                                st.session_state.detection_count += 1
-                                log_entry = f"⚠️ {det['object'].upper()} - {det['proximity']}"
-                                st.session_state.detection_log.insert(0, log_entry)
-                                if len(st.session_state.detection_log) > 10:
-                                    st.session_state.detection_log.pop()
+                    detection_data = []
+                    for det in detections:
+                        detection_data.append({
+                            'Object': det['object'],
+                            'Confidence': f"{det['confidence']:.1%}",
+                            'Proximity': det['proximity'],
+                            'Area %': det['area_percent']
+                        })
+                        
+                        # Update log
+                        if det['proximity'] in ['close', 'medium distance']:
+                            st.session_state.detection_count += 1
+                            log_entry = f"⚠️ {det['object'].upper()} - {det['proximity']}"
+                            st.session_state.detection_log.insert(0, log_entry)
+                            if len(st.session_state.detection_log) > 10:
+                                st.session_state.detection_log.pop()
 
-                        st.dataframe(pd.DataFrame(detection_data), use_container_width=True)
+                    st.dataframe(pd.DataFrame(detection_data), use_column_width=True)
 
-                        # Speak detections
-                        for det in detections:
-                            if det['proximity'] in ['close', 'medium distance']:
-                                tts_handler.speak(f"{det['proximity']} {det['object']} detected")
-                                time.sleep(0.5)
-                    else:
-                        st.info("No important objects detected")
+                    # Speak detections
+                    for det in detections:
+                        if det['proximity'] in ['close', 'medium distance']:
+                            tts_handler.speak(f"{det['proximity']} {det['object']} detected")
+                            time.sleep(0.5)
+                else:
+                    st.info("No important objects detected")
 
 # ============================================================================
-# VIDEO UPLOAD MODE
+# VIDEO UPLOAD
 # ============================================================================
-elif st.session_state.mode == "video":
-    st.subheader("🎬 Upload a Video")
+st.markdown("---")
+st.subheader("🎬 Video Detection")
 
-    uploaded_file = st.file_uploader("Choose a video...", type=['mp4', 'avi', 'mov', 'mkv'])
+uploaded_video = st.file_uploader("Choose a video...", type=['mp4', 'avi', 'mov', 'mkv'], key="video_upload")
 
-    if uploaded_file:
-        if not detection_system.model_loaded:
-            st.error("⚠️ Please load the model first!")
-        else:
-            tfile = tempfile.NamedTemporaryFile(delete=False, suffix='.mp4')
-            tfile.write(uploaded_file.read())
-            tfile.close()
+if uploaded_video:
+    if not detection_system.model_loaded:
+        st.error("⚠️ Please load the model first!")
+    else:
+        # Save uploaded video to temp file
+        tfile = tempfile.NamedTemporaryFile(delete=False, suffix='.mp4')
+        tfile.write(uploaded_video.read())
+        tfile.close()
 
+        # Process video
+        with st.spinner("Processing video..."):
+            # Use OpenCV directly for video processing
             cap = cv2.VideoCapture(tfile.name)
             fps = int(cap.get(cv2.CAP_PROP_FPS))
             total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-
-            st.info(f"Video: {total_frames} frames at {fps} FPS")
-
+            
             progress_bar = st.progress(0)
             video_placeholder = st.empty()
             detection_stats = []
-
+            
             frame_count = 0
             processed_count = 0
             skip_frames = max(1, fps // 3)
-
+            
             while cap.isOpened():
                 ret, frame = cap.read()
                 if not ret:
                     break
-
+                    
                 if frame_count % skip_frames == 0:
                     processed_frame, detections = detection_system.process_frame(
                         frame, save_detection=st.session_state.save_detections
                     )
-
+                    
+                    # Update progress
                     if total_frames > 0:
                         progress = processed_count / (total_frames / skip_frames)
                         progress_bar.progress(min(1.0, progress))
-
+                    
+                    # Display frame
                     processed_frame_rgb = cv2.cvtColor(processed_frame, cv2.COLOR_BGR2RGB)
                     video_placeholder.image(processed_frame_rgb, channels="RGB", use_column_width=True)
-
+                    
                     for det in detections:
                         if det['proximity'] in ['close', 'medium distance']:
                             detection_stats.append(det)
@@ -492,31 +522,33 @@ elif st.session_state.mode == "video":
                             st.session_state.detection_log.insert(0, log_entry)
                             if len(st.session_state.detection_log) > 10:
                                 st.session_state.detection_log.pop()
-
+                    
                     processed_count += 1
-
+                    
                 frame_count += 1
-
+                
             cap.release()
             os.unlink(tfile.name)
             
             st.success(f"✅ Complete! {len(detection_stats)} detections")
             st.metric("Total Detections", len(detection_stats))
-
+            
             if detection_stats:
                 df_stats = pd.DataFrame(detection_stats)
                 if 'bbox' in df_stats.columns:
                     df_stats = df_stats.drop(columns=['bbox'])
-                st.dataframe(df_stats, use_container_width=True)
+                st.dataframe(df_stats, use_column_width=True)
 
 # ============================================================================
 # Update stats display
 # ============================================================================
 if st.session_state.detection_log:
     log_text = "\n".join(st.session_state.detection_log[:10])
-    log_placeholder.markdown(f"```\n{log_text}\n```")
+    with tab1:
+        log_placeholder.markdown(f"```\n{log_text}\n```")
 
-stats_placeholder.metric("Total Detections", st.session_state.detection_count)
+with tab1:
+    stats_placeholder.metric("Total Detections", st.session_state.detection_count)
 
 # ============================================================================
 # TAB 2: DETECTION LOG
@@ -525,8 +557,26 @@ with tab2:
     if detection_system.detection_history:
         df_log = detection_system.get_export_data()
         st.dataframe(df_log, use_container_width=True)
+        
+        # Add filter options
+        st.subheader("🔍 Filter Detections")
+        col_f1, col_f2 = st.columns(2)
+        with col_f1:
+            if 'object' in df_log.columns:
+                object_filter = st.multiselect("Object Type", options=sorted(df_log['object'].unique()))
+        with col_f2:
+            if 'proximity' in df_log.columns:
+                proximity_filter = st.multiselect("Proximity", options=sorted(df_log['proximity'].unique()))
+        
+        if object_filter or proximity_filter:
+            filtered_df = df_log.copy()
+            if object_filter:
+                filtered_df = filtered_df[filtered_df['object'].isin(object_filter)]
+            if proximity_filter:
+                filtered_df = filtered_df[filtered_df['proximity'].isin(proximity_filter)]
+            st.dataframe(filtered_df, use_container_width=True)
     else:
-        st.info("No detections yet")
+        st.info("No detections yet. Upload an image or video to get started!")
 
 # ============================================================================
 # TAB 3: ANALYTICS
@@ -535,20 +585,58 @@ with tab3:
     if detection_system.detection_history:
         df = detection_system.get_export_data()
         
+        # Metrics
         col_a1, col_a2, col_a3, col_a4 = st.columns(4)
         with col_a1:
-            st.metric("Total", len(df))
+            st.metric("Total Detections", len(df))
         with col_a2:
-            st.metric("Unique", df['object'].nunique())
+            st.metric("Unique Objects", df['object'].nunique())
         with col_a3:
-            st.metric("Close", len(df[df['proximity'] == 'close']))
+            st.metric("Close Objects", len(df[df['proximity'] == 'close']))
         with col_a4:
-            st.metric("Avg Conf", f"{df['confidence'].mean():.1%}")
+            st.metric("Avg Confidence", f"{df['confidence'].mean():.1%}")
         
-        st.subheader("Top Objects")
-        st.bar_chart(df['object'].value_counts().head(10))
+        # Charts
+        st.subheader("Top Detected Objects")
+        if 'object' in df.columns:
+            st.bar_chart(df['object'].value_counts().head(10))
+        
+        st.subheader("Proximity Distribution")
+        if 'proximity' in df.columns:
+            st.bar_chart(df['proximity'].value_counts())
+        
+        # Export report
+        st.subheader("Export Analytics")
+        if st.button("Generate JSON Report"):
+            report = {
+                'summary': {
+                    'total_detections': len(df),
+                    'unique_objects': int(df['object'].nunique()),
+                    'close_detections': int(len(df[df['proximity'] == 'close'])),
+                    'medium_detections': int(len(df[df['proximity'] == 'medium distance'])),
+                    'average_confidence': float(df['confidence'].mean()),
+                    'top_object': str(df['object'].value_counts().index[0]) if not df.empty else None
+                },
+                'object_counts': df['object'].value_counts().to_dict(),
+                'proximity_counts': df['proximity'].value_counts().to_dict(),
+                'export_time': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            }
+            
+            report_json = json.dumps(report, indent=2)
+            b64 = base64.b64encode(report_json.encode()).decode()
+            href = f'<a href="data:file/json;base64,{b64}" download="analytics_report_{datetime.now().strftime("%Y%m%d_%H%M%S")}.json">Download JSON Report</a>'
+            st.markdown(href, unsafe_allow_html=True)
     else:
-        st.info("No data available")
+        st.info("No data available. Upload an image or video to see analytics!")
 
+# ============================================================================
+# FOOTER
+# ============================================================================
 st.markdown("---")
-st.markdown("💡 **How to use:** Load model → Upload image/video → Listen to voice alerts → Export data")
+st.markdown("""
+<div style="text-align: center; color: #888; padding: 20px;">
+    <p>🎯 <strong>How it works:</strong> YOLOv8 detects objects → Filters important obstacles → Checks if directly ahead → Announces close/medium objects via voice</p>
+    <p>💡 <strong>Tips:</strong> Adjust thresholds in sidebar | Export data for analysis | Supports images and videos</p>
+    <p>🔊 <strong>Voice feedback helps blind/low-vision users navigate safely</strong></p>
+</div>
+""", unsafe_allow_html=True)
