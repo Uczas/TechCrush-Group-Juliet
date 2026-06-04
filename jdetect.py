@@ -11,10 +11,9 @@ import json
 import base64
 import tempfile
 import os
-import threading
-import queue
 from streamlit_webrtc import webrtc_streamer, VideoTransformerBase, RTCConfiguration
-import av
+from aiortc.contrib.media import MediaRelay
+import asyncio
 
 # ============================================================================
 # PAGE CONFIGURATION
@@ -27,7 +26,7 @@ st.set_page_config(
 )
 
 # ============================================================================
-# CUSTOM CSS (Minified for performance)
+# CUSTOM CSS
 # ============================================================================
 st.markdown("""
 <style>
@@ -43,15 +42,15 @@ st.markdown("""
 # CONFIGURATION
 # ============================================================================
 CONFIDENCE_THRESHOLD = 0.5
-FRAME_SKIP = 3  # Increased for better performance
+FRAME_SKIP = 3
 CLOSE_THRESHOLD_PERCENT = 15
 MEDIUM_THRESHOLD_PERCENT = 5
 CENTER_ZONE_WIDTH_PERCENT = 40
 COOLDOWN_SECONDS = 3
 MAX_OBJECTS_PER_ANNOUNCEMENT = 3
-MAX_HISTORY_SIZE = 500  # Limit history size
+MAX_HISTORY_SIZE = 500
 
-# Important objects (keep as is)
+# Important objects
 IMPORTANT_OBJECTS = {
     'person', 'bicycle', 'car', 'motorcycle', 'bus', 'truck', 'train',
     'fire hydrant', 'stop sign', 'parking meter', 'bench', 'dog', 'cat',
@@ -67,69 +66,55 @@ IMPORTANT_OBJECTS = {
 }
 
 # ============================================================================
-# CLOUD-FRIENDLY SPEECH HANDLER (Using browser's Web Speech API)
+# WEB SPEECH HANDLER (Browser-based)
 # ============================================================================
 class WebSpeechHandler:
-    """Uses browser's Web Speech API instead of pyttsx3 for cloud deployment"""
-    
     def __init__(self):
         self.last_alert_time = defaultdict(float)
         self.muted = False
         self.rate = 1.0
-        self.pitch = 1.0
         
     def speak(self, text):
-        """Send speech command to browser via JavaScript"""
         if not self.muted and text:
-            # Escape special characters
-            text = text.replace("'", "\\'").replace('"', '\\"')
-            # Use st.components.v1.html to trigger browser speech
+            text = text.replace("'", "\\'").replace('"', '\\"').replace('\n', ' ')
             js_code = f"""
             <script>
-                if (window.speechSynthesis) {{
-                    var utterance = new SpeechSynthesisUtterance('{text}');
-                    utterance.rate = {self.rate};
-                    window.speechSynthesis.cancel();
-                    window.speechSynthesis.speak(utterance);
-                }}
+                (function() {{
+                    if (window.speechSynthesis) {{
+                        var utterance = new SpeechSynthesisUtterance('{text}');
+                        utterance.rate = {self.rate};
+                        window.speechSynthesis.cancel();
+                        window.speechSynthesis.speak(utterance);
+                    }}
+                }})();
             </script>
             """
             st.components.v1.html(js_code, height=0, width=0)
     
     def can_announce(self, object_name, current_time):
-        """Check cooldown"""
         last_time = self.last_alert_time[object_name]
         return (current_time - last_time) >= COOLDOWN_SECONDS
     
     def update_alert_time(self, object_name, current_time):
-        """Update last announcement time"""
         self.last_alert_time[object_name] = current_time
     
     def toggle_mute(self):
-        """Toggle mute"""
         self.muted = not self.muted
         if not self.muted:
-            # Clear any pending speech
-            js_code = """
-            <script>
-                if (window.speechSynthesis) {
-                    window.speechSynthesis.cancel();
-                }
-            </script>
-            """
-            st.components.v1.html(js_code, height=0, width=0)
+            st.components.v1.html("""
+                <script>
+                    if (window.speechSynthesis) {
+                        window.speechSynthesis.cancel();
+                    }
+                </script>
+            """, height=0, width=0)
         return not self.muted
     
     def set_rate(self, rate):
-        """Set speech rate (0.5 to 2)"""
-        self.rate = max(0.5, min(2.0, rate / 100))  # Convert from 50-200 scale
-    
-    def set_volume(self, volume):
-        """Volume placeholder (Web Speech API doesn't support volume in all browsers)"""
-        pass  # Web Speech API volume control is limited
+        self.rate = max(0.5, min(2.0, rate / 100))
 
 # ============================================================================
-# WEBRTC VIDEO TRANSFORMER (Cloud-optimized)
+# VIDEO TRANSFORMER (Fixed - no av dependency)
 # ============================================================================
 class VideoTransformer(VideoTransformerBase):
     def __init__(self, detection_system, save_detections):
@@ -137,34 +122,41 @@ class VideoTransformer(VideoTransformerBase):
         self.save_detections = save_detections
         self.frame_count = 0
         
-    def transform(self, frame):
-        img = frame.to_ndarray(format="bgr24")
-        
-        # Skip frames for performance
-        self.frame_count += 1
-        if self.frame_count % FRAME_SKIP != 0:
-            return av.VideoFrame.from_ndarray(img, format="bgr24")
-        
-        # Process frame
-        processed_img, detections = self.detection_system.process_frame(
-            img, save_detection=self.save_detections
-        )
-        
-        # Update session stats
-        for det in detections:
-            if det['proximity'] in ['close', 'medium distance']:
-                if 'detection_count' in st.session_state:
-                    st.session_state.detection_count += 1
-                if 'detection_log' in st.session_state:
-                    log_entry = f"⚠️ {det['object'].upper()} - {det['proximity']} ({det['confidence']:.0%})"
-                    st.session_state.detection_log.insert(0, log_entry)
-                    if len(st.session_state.detection_log) > 10:
-                        st.session_state.detection_log.pop()
-        
-        return av.VideoFrame.from_ndarray(processed_img, format="bgr24")
+    def recv(self, frame):
+        """Receive frame from webcam"""
+        try:
+            # Convert frame to numpy array
+            img = frame.to_ndarray(format="bgr24")
+            
+            # Skip frames for performance
+            self.frame_count += 1
+            if self.frame_count % FRAME_SKIP != 0:
+                return frame
+            
+            # Process frame
+            processed_img, detections = self.detection_system.process_frame(
+                img, save_detection=self.save_detections
+            )
+            
+            # Update session stats
+            for det in detections:
+                if det['proximity'] in ['close', 'medium distance']:
+                    if 'detection_count' in st.session_state:
+                        st.session_state.detection_count += 1
+                    if 'detection_log' in st.session_state:
+                        log_entry = f"⚠️ {det['object'].upper()} - {det['proximity']} ({det['confidence']:.0%})"
+                        st.session_state.detection_log.insert(0, log_entry)
+                        if len(st.session_state.detection_log) > 10:
+                            st.session_state.detection_log.pop()
+            
+            # Convert back to frame
+            return frame.from_ndarray(processed_img, format="bgr24")
+        except Exception as e:
+            print(f"Frame processing error: {e}")
+            return frame
 
 # ============================================================================
-# DETECTION SYSTEM (Optimized)
+# DETECTION SYSTEM
 # ============================================================================
 class ObjectDetectionSystem:
     def __init__(self):
@@ -173,13 +165,11 @@ class ObjectDetectionSystem:
         self.model_loaded = False
 
     def load_model(self):
-        """Load YOLO model with memory optimization"""
         if self.model_loaded:
             return True
             
         with st.spinner("Loading YOLO model..."):
             try:
-                # Use smaller model for better performance
                 self.model = YOLO('yolov8n.pt')
                 # Warm up model
                 dummy = np.zeros((640, 640, 3), dtype=np.uint8)
@@ -191,7 +181,6 @@ class ObjectDetectionSystem:
                 return False
 
     def estimate_proximity(self, bbox_area, total_area):
-        """Estimate object proximity"""
         area_percentage = (bbox_area / total_area) * 100
         if area_percentage >= CLOSE_THRESHOLD_PERCENT:
             proximity = "close"
@@ -202,13 +191,11 @@ class ObjectDetectionSystem:
         return proximity, area_percentage
 
     def is_in_center_zone(self, bbox_center_x, frame_width):
-        """Check if object is in center zone"""
         center_threshold = (frame_width * CENTER_ZONE_WIDTH_PERCENT) / 200
         frame_center = frame_width / 2
         return abs(bbox_center_x - frame_center) <= center_threshold
 
     def process_frame(self, frame, save_detection=False):
-        """Process frame efficiently"""
         if self.model is None:
             return frame, []
 
@@ -216,7 +203,7 @@ class ObjectDetectionSystem:
         detected_obstacles = []
         detection_results = []
 
-        # Resize frame for faster processing if too large
+        # Resize for performance
         h, w = frame.shape[:2]
         if w > 640:
             scale = 640 / w
@@ -225,10 +212,11 @@ class ObjectDetectionSystem:
             frame_small = cv2.resize(frame, (new_w, new_h))
         else:
             frame_small = frame
+            scale_x = scale_y = 1
 
         results = self.model(frame_small, conf=CONFIDENCE_THRESHOLD, verbose=False)
 
-        # Scale factor for coordinates
+        # Scale factors
         scale_x = w / new_w if w > 640 else 1
         scale_y = h / new_h if w > 640 else 1
 
@@ -238,7 +226,6 @@ class ObjectDetectionSystem:
                 for box in boxes:
                     x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
                     
-                    # Scale back coordinates
                     x1, x2 = int(x1 * scale_x), int(x2 * scale_x)
                     y1, y2 = int(y1 * scale_y), int(y2 * scale_y)
                     
@@ -273,19 +260,18 @@ class ObjectDetectionSystem:
 
                         if save_detection:
                             self.detection_history.append(detection_info)
-                            # Limit history size
                             if len(self.detection_history) > MAX_HISTORY_SIZE:
                                 self.detection_history = self.detection_history[-MAX_HISTORY_SIZE:]
 
-                        # Draw bounding box (thinner lines for performance)
+                        # Draw bounding box
                         color = (0, 0, 255) if proximity == 'close' else (0, 165, 255)
-                        cv2.rectangle(frame, (x1, y1), (x2, y2), color, 1)
+                        cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
 
                         label = f"{class_name}: {confidence:.2f} ({proximity})"
                         cv2.putText(frame, label, (x1, y1 - 5),
-                                   cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
+                                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
 
-        # Announce obstacles (using web speech)
+        # Announce obstacles
         if detected_obstacles and 'tts_handler' in st.session_state:
             current_time = time.time()
             filtered_obstacles = []
@@ -313,7 +299,6 @@ class ObjectDetectionSystem:
         return frame, detection_results
 
     def process_image(self, image):
-        """Process a single image"""
         if self.model is None:
             return None, []
 
@@ -326,7 +311,6 @@ class ObjectDetectionSystem:
         return self.process_frame(image, save_detection=True)
 
     def get_export_data(self):
-        """Get detection history for export"""
         if not self.detection_history:
             return pd.DataFrame()
 
@@ -336,7 +320,6 @@ class ObjectDetectionSystem:
         return df
 
     def clear_history(self):
-        """Clear detection history"""
         self.detection_history = []
 
 # ============================================================================
@@ -354,8 +337,6 @@ if 'detection_log' not in st.session_state:
     st.session_state.detection_log = []
 if 'detection_count' not in st.session_state:
     st.session_state.detection_count = 0
-if 'webrtc_ctx' not in st.session_state:
-    st.session_state.webrtc_ctx = None
 
 detection_system = st.session_state.detection_system
 tts_handler = st.session_state.tts_handler
@@ -365,7 +346,6 @@ tts_handler = st.session_state.tts_handler
 # ============================================================================
 st.sidebar.title("🎛️ Controls")
 
-# Model loading
 if st.sidebar.button("📦 Load YOLO Model", use_container_width=True):
     if detection_system.load_model():
         st.sidebar.success("✅ Model ready!")
@@ -406,7 +386,7 @@ globals()['COOLDOWN_SECONDS'] = cooldown
 
 st.sidebar.markdown("---")
 
-# Voice settings (simplified for web speech)
+# Voice settings
 st.sidebar.subheader("🔊 Voice Settings")
 voice_rate = st.sidebar.slider("Speech Rate", 50, 200, 100, 10)
 tts_handler.set_rate(voice_rate)
@@ -433,8 +413,6 @@ if st.sidebar.button("📊 Export as CSV", use_container_width=True):
         href = f'<a href="data:file/csv;base64,{b64}" download="detection_log_{datetime.now().strftime("%Y%m%d_%H%M%S")}.csv">Download CSV</a>'
         st.sidebar.markdown(href, unsafe_allow_html=True)
         st.sidebar.success(f"Exported {len(df)} detections!")
-    else:
-        st.sidebar.warning("No detections to export")
 
 if st.sidebar.button("🗑️ Clear History", use_container_width=True):
     detection_system.clear_history()
@@ -482,7 +460,7 @@ with tab1:
         stats_placeholder = st.empty()
 
 # ============================================================================
-# WEBCAM MODE (Using streamlit-webrtc for cloud compatibility)
+# WEBCAM MODE
 # ============================================================================
 if st.session_state.mode == "webcam":
     if detection_system.model is None:
@@ -490,19 +468,13 @@ if st.session_state.mode == "webcam":
     else:
         st.info("🎥 Webcam mode active. Click 'Start' to begin detection.")
         
-        rtc_config = RTCConfiguration(
-            {"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]}
-        )
-        
-        ctx = webrtc_streamer(
+        webrtc_streamer(
             key="object-detection",
             video_transformer_factory=lambda: VideoTransformer(detection_system, st.session_state.save_detections),
-            rtc_configuration=rtc_config,
+            rtc_configuration={"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]},
             media_stream_constraints={"video": True, "audio": False},
             async_processing=True,
         )
-        
-        st.session_state.webrtc_ctx = ctx
         
         # Update stats display
         if st.session_state.detection_log:
@@ -554,7 +526,6 @@ elif st.session_state.mode == "image":
 
                         st.dataframe(pd.DataFrame(detection_data))
 
-                        # Announce detections one by one
                         for det in detections:
                             if det['proximity'] in ['close', 'medium distance']:
                                 tts_handler.speak(f"{det['proximity']} {det['object']} detected")
@@ -563,7 +534,7 @@ elif st.session_state.mode == "image":
                         st.info("No important objects detected in this image")
 
 # ============================================================================
-# VIDEO UPLOAD MODE (Optimized)
+# VIDEO UPLOAD MODE
 # ============================================================================
 elif st.session_state.mode == "video":
     st.subheader("🎬 Upload a Video for Detection")
@@ -590,7 +561,7 @@ elif st.session_state.mode == "video":
 
             frame_count = 0
             processed_count = 0
-            skip_frames = max(1, fps // 3)  # Process at 3 FPS max
+            skip_frames = max(1, fps // 3)
 
             while cap.isOpened():
                 ret, frame = cap.read()
@@ -665,10 +636,8 @@ with tab2:
         if not filtered_df.empty:
             st.write(f"Showing {len(filtered_df)} detections")
             st.dataframe(filtered_df, use_container_width=True)
-        else:
-            st.info("No matching detections")
     else:
-        st.info("No detections recorded yet. Run detection with 'Save detections' enabled.")
+        st.info("No detections recorded yet.")
 
 # ============================================================================
 # TAB 3: ANALYTICS
